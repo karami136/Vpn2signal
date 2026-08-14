@@ -4,6 +4,7 @@ import asyncio
 import httpx
 
 CENTRAL_URL = os.environ.get("CENTRAL_URL", "https://panel-rvg.arvin341az.workers.dev").rstrip("/")
+SALES_BOT_ENABLED = os.environ.get("SALES_BOT_ENABLED", "0").strip() == "1"
 
 
 async def register_instance():
@@ -23,9 +24,27 @@ async def register_instance():
         pass
 
 
+async def register_sales_bot():
+    """اعلام اختیاری فعال بودن ربات فروش به Worker مرکزی؛ هیچ Secretی ارسال نمی‌شود."""
+    if not SALES_BOT_ENABLED or not CENTRAL_URL:
+        return
+    from main import get_host
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(
+                f"{CENTRAL_URL}/api/register-sales-bot",
+                json={"domain": get_host(), "enabled": True},
+            )
+    except Exception:
+        # اگر Worker فعلی این endpoint را ندارد، نباید پنل RVG مختل شود.
+        pass
+
+
 async def heartbeat_loop():
     while True:
         await register_instance()
+        if SALES_BOT_ENABLED:
+            await register_sales_bot()
         await asyncio.sleep(300)
 
 

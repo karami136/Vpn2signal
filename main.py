@@ -1382,6 +1382,164 @@ async def node_create_link(request: Request, key_id: str = Depends(require_node_
     # sub_id در اینجا به گروهِ محلیِ همین نود اشاره دارد (نه پنل مرکزی)؛ اگر معتبر نباشد نادیده گرفته می‌شود
     return await _create_link_core(body)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Telegram Sales Bot API
+# این API مخصوص ربات فروش است و کلید آن با Node Key جداست.
+# Secret: RVG_BOT_API_KEY
+# Header: X-RVG-Bot-Key
+# ══════════════════════════════════════════════════════════════════════════════
+BOT_API_KEY_HEADER = "X-RVG-Bot-Key"
+RVG_BOT_API_KEY = os.environ.get("RVG_BOT_API_KEY", "").strip()
+
+async def require_bot_api_key(request: Request):
+    if not RVG_BOT_API_KEY:
+        raise HTTPException(status_code=503, detail="RVG_BOT_API_KEY is not configured")
+    supplied = (request.headers.get(BOT_API_KEY_HEADER) or "").strip()
+    if not supplied or not secrets.compare_digest(supplied, RVG_BOT_API_KEY):
+        raise HTTPException(status_code=401, detail="invalid bot api key")
+    return True
+
+@app.get("/api/bot/health")
+async def bot_health(_=Depends(require_bot_api_key)):
+    async with LINKS_LOCK:
+        total = len(LINKS)
+        active = sum(1 for link in LINKS.values() if is_link_allowed(link))
+    return {
+        "ok": True,
+        "service": "RVG Telegram Sales Bot API",
+        "version": "1",
+        "links_count": total,
+        "active_links": active,
+    }
+
+@app.post("/api/bot/links")
+async def bot_create_link(request: Request, _=Depends(require_bot_api_key)):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+
+    try:
+        limit_value = float(body.get("limit_value") or 0)
+        expires_days = int(body.get("expires_days") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit_value/expires_days invalid")
+
+    if limit_value <= 0:
+        raise HTTPException(status_code=400, detail="limit_value must be greater than zero")
+    if expires_days <= 0 or expires_days > 3650:
+        raise HTTPException(status_code=400, detail="expires_days must be between 1 and 3650")
+
+    protocol = str(body.get("protocol") or DEFAULT_PROTOCOL)
+    if protocol not in PROTOCOLS:
+        protocol = DEFAULT_PROTOCOL
+
+    clean_body = {
+        "label": str(body.get("label") or "Telegram Customer")[:60],
+        "limit_value": limit_value,
+        "limit_unit": str(body.get("limit_unit") or "GB").upper(),
+        "expires_days": expires_days,
+        "note": str(body.get("note") or "")[:200],
+        "protocol": protocol,
+        "fingerprint": str(body.get("fingerprint") or "chrome")[:20],
+        "alpn": str(body.get("alpn") or "h2,http/1.1")[:60],
+    }
+
+    if clean_body["limit_unit"] not in ("GB", "MB", "KB"):
+        raise HTTPException(status_code=400, detail="unsupported limit_unit")
+
+    result = await _create_link_core(clean_body)
+    return {
+        "ok": True,
+        "uuid": result["uuid"],
+        "label": result["label"],
+        "protocol": result["protocol"],
+        "limit_bytes": result["limit_bytes"],
+        "expires_at": result["expires_at"],
+        "vless_link": result["vless_link"],
+        "sub_url": result["sub_url"],
+    }
+
+@app.get("/api/bot/links/{uuid}")
+async def bot_get_link(uuid: str, _=Depends(require_bot_api_key)):
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+        if not link:
+            raise HTTPException(status_code=404, detail="link not found")
+        snapshot = dict(link)
+
+    host = get_host()
+    proto = snapshot.get("protocol", DEFAULT_PROTOCOL)
+    return {
+        "ok": True,
+        "uuid": uuid,
+        "label": snapshot.get("label"),
+        "active": bool(snapshot.get("active", True)),
+        "expired": is_link_expired(snapshot),
+        "used_bytes": int(snapshot.get("used_bytes", 0)),
+        "limit_bytes": int(snapshot.get("limit_bytes", 0)),
+        "expires_at": snapshot.get("expires_at"),
+        "protocol": proto,
+        "vless_link": generate_share_link(
+            uuid, host,
+            remark=f"RVG-{snapshot.get('label', 'RVG')}",
+            protocol=proto
+        ),
+        "sub_url": f"https://{host}/sub/{uuid}",
+    }
+
+@app.delete("/api/bot/links/{uuid}")
+async def bot_disable_link(uuid: str, _=Depends(require_bot_api_key)):
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+        if not link:
+            raise HTTPException(status_code=404, detail="link not found")
+        link["active"] = False
+
+    asyncio.create_task(save_state())
+    log_activity("bot", f"کانفیگ {uuid[:8]} توسط Telegram Sales Bot غیرفعال شد", "warn")
+    return {"ok": True, "uuid": uuid, "active": False}
+
+@app.post("/api/bot/links/{uuid}/renew")
+async def bot_renew_link(uuid: str, request: Request, _=Depends(require_bot_api_key)):
+    try:
+        body = await request.json()
+        days = int(body.get("days") or 30)
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="days invalid")
+
+    if days <= 0 or days > 3650:
+        raise HTTPException(status_code=400, detail="days must be between 1 and 3650")
+
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+        if not link:
+            raise HTTPException(status_code=404, detail="link not found")
+
+        now = datetime.now()
+        old_exp = link.get("expires_at")
+        try:
+            base = datetime.fromisoformat(old_exp) if old_exp else now
+        except Exception:
+            base = now
+
+        if base < now:
+            base = now
+
+        link["expires_at"] = (base + timedelta(days=days)).isoformat()
+        link["active"] = True
+        expires_at = link["expires_at"]
+
+    asyncio.create_task(save_state())
+    log_activity("bot", f"تمدید کانفیگ {uuid[:8]} به مدت {days} روز", "ok")
+    return {
+        "ok": True,
+        "uuid": uuid,
+        "active": True,
+        "expires_at": expires_at,
+    }
+
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     host = get_host()
